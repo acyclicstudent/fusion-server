@@ -55,6 +55,7 @@
     "typescript": "^5.4.2"
   },
   "dependencies": {
-    "reflect-metadata": "^0.2.1"
+    "reflect-metadata": "^0.2.1",
+    "tsyringe": "^4.8.0"
   }
 }
