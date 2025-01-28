@@ -2,7 +2,6 @@ import { injectable } from "tsyringe";
 
 export function Controller(route: string): ClassDecorator {
     return function (target) {
-        console.log('Registering: ', target.name, target);
         injectable()(target as any);
         Reflect.defineMetadata('fusion:route', route, target);
         const gets = Reflect.getMetadata('fusion:get', target) || {};

@@ -29,7 +29,7 @@ export class FusionServer {
             try { 
                 let stage = context.invokedFunctionArn.split(":").pop() || 'dev';
                 if (!['dev', 'qa', 'staging', 'prod'].includes(stage)) stage = 'dev';
-                console.log('Running Stage: ', stage);
+                container.register('stage', { useValue: stage });
                 
                 const [controllerPath, handler] = (this as any)[event.httpMethod][event.resource].split('|'); 
                 const controller: any = await container.resolve(this.controllers[controllerPath]);

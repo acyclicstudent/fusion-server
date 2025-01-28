@@ -1,6 +1,7 @@
 export * from './dependencies/executor';
 export * from './dependencies/inject';
 export * from './dependencies/use-case';
+export * from './stages/stage';
 export * from './dependencies/injectable';
 export * from './interfaces/controller';
 export * from './http/delete';
