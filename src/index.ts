@@ -8,3 +8,4 @@ export * from './core/exceptions';
 export * from './core/interfaces/evt-listener';
 export * from './core/classes';
 export * from './fusion-server';
+export { container } from 'tsyringe';
