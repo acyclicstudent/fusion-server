@@ -2,6 +2,7 @@ import { APIGatewayEvent, Context } from "aws-lambda";
 import { container, InjectionToken } from "tsyringe";
 import { registerServices } from "./core/registry";
 import { EvtListener } from './core/interfaces/evt-listener';
+import { FusionResponse } from './core/classes/fusion-response';
 
 export interface ICreateHandler {
     controllers: any[];
@@ -18,47 +19,135 @@ export class FusionServer {
     private PATCH = {};
 
     public createHandler(params: ICreateHandler) {
+        this.validateHandlerParams(params);
+        
         // Register injectable services.
         registerServices();
+        
         if (params.listeners) {
             // Register listeners
             params.listeners.forEach((handler: InjectionToken<EvtListener>) => {
-                this.listeners[Reflect.getMetadata('fusion:listener', handler)] = handler;
+                const eventName = Reflect.getMetadata('fusion:listener', handler);
+                if (!eventName) {
+                    console.warn(`[FusionServer Warning] Listener ${handler.toString()} is missing @Listener decorator`);
+                    return;
+                }
+                this.listeners[eventName] = handler;
             });
         }
+        
         params.controllers.forEach((controller: Function) => {
-            this.controllers[Reflect.getMetadata('fusion:route', controller)] = controller;
-            Object.assign(this.GET, Reflect.getMetadata('fusion:get', controller))
-            Object.assign(this.POST, Reflect.getMetadata('fusion:post', controller))
-            Object.assign(this.DELETE, Reflect.getMetadata('fusion:delete', controller))
-            Object.assign(this.PUT, Reflect.getMetadata('fusion:put', controller))
-            Object.assign(this.PATCH, Reflect.getMetadata('fusion:patch', controller))
+            const route = Reflect.getMetadata('fusion:route', controller);
+            if (!route) {
+                console.warn(`[FusionServer Warning] Controller ${controller.name} is missing @Controller decorator`);
+                return;
+            }
+            
+            this.controllers[route] = controller;
+            Object.assign(this.GET, Reflect.getMetadata('fusion:get', controller) || {})
+            Object.assign(this.POST, Reflect.getMetadata('fusion:post', controller) || {})
+            Object.assign(this.DELETE, Reflect.getMetadata('fusion:delete', controller) || {})
+            Object.assign(this.PUT, Reflect.getMetadata('fusion:put', controller) || {})
+            Object.assign(this.PATCH, Reflect.getMetadata('fusion:patch', controller) || {})
         });
+        
         return async (evt: any, context: Context) => {
-            let stage = context.invokedFunctionArn.split(":").pop() || 'dev';
-            if (!['dev', 'qa', 'staging', 'prod'].includes(stage)) stage = 'dev';
-            container.register('stage', { useValue: stage });
+            try {
+                let stage = context.invokedFunctionArn.split(":").pop() || 'dev';
+                if (!['dev', 'qa', 'staging', 'prod'].includes(stage)) stage = 'dev';
+                container.register('stage', { useValue: stage });
 
-            if (evt.event) return await this.handleListener(evt);
+                if (evt.event) return await this.handleListener(evt);
 
-            return await this.handleController(evt);
+                return await this.handleController(evt);
+            } catch (err) {
+                console.error('[FusionServer Handler Error]', {
+                    message: (err as any).message,
+                    stack: (err as any).stack,
+                    event: evt,
+                    context: context,
+                    timestamp: new Date().toISOString()
+                });
+                
+                return {
+                    statusCode: 500,
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        message: 'Internal server error',
+                        requestId: context.awsRequestId
+                    })
+                };
+            }
+        }
+    }
+
+    private validateHandlerParams(params: ICreateHandler): void {
+        if (!params.controllers || !Array.isArray(params.controllers) || params.controllers.length === 0) {
+            throw new Error('At least one controller is required');
+        }
+        
+        params.controllers.forEach((controller, index) => {
+            if (typeof controller !== 'function') {
+                throw new Error(`Controller at index ${index} must be a class constructor`);
+            }
+        });
+        
+        if (params.listeners) {
+            if (!Array.isArray(params.listeners)) {
+                throw new Error('Listeners must be an array');
+            }
+            
+            params.listeners.forEach((listener, index) => {
+                if (typeof listener !== 'function') {
+                    throw new Error(`Listener at index ${index} must be a class constructor`);
+                }
+            });
         }
     }
 
     private async handleListener(evt: any) {
         try {
-            if (!(evt.event in this.listeners)) throw new Error(`Unregistered listener \"${evt.event}\"`)
-            const listener = await container.resolve(this.listeners[evt.event]);
+            if (!evt.event) {
+                throw new Error('Event name is required but not provided');
+            }
+            
+            if (!(evt.event in this.listeners)) {
+                throw new Error(`Unregistered listener for event: ${evt.event}`);
+            }
+            
+            const listenerClass = this.listeners[evt.event];
+            const listener = await container.resolve(listenerClass);
+            
+            if (!listener) {
+                throw new Error(`Failed to resolve listener instance for event: ${evt.event}`);
+            }
+            
+            if (typeof listener.handle !== 'function') {
+                throw new Error(`Listener for event '${evt.event}' does not implement handle() method`);
+            }
 
+            const result = await listener.handle(evt);
+            
             return {
                 success: true,
-                body: await listener.handle(evt)
+                body: result
             }
         } catch (err) {
+            const error = err as any;
+            console.error('[FusionServer Listener Error]', {
+                message: error.message,
+                stack: error.stack,
+                event: evt.event,
+                timestamp: new Date().toISOString()
+            });
+            
             return {
                 success: false,
                 body: {
-                    message: (err as any).message
+                    message: error.message || 'Listener execution failed',
+                    event: evt.event
                 }
             }
         }
@@ -66,31 +155,77 @@ export class FusionServer {
 
     private async handleController(event: APIGatewayEvent) {
         try { 
-            const [controllerPath, handler] = (this as any)[event.httpMethod]?.[event.resource]?.split('|') || [];
-            if (!controllerPath) throw new Error(`Unregistered controller for route ${event.httpMethod} ${event.resource}`); 
-            const controller: any = await container.resolve(this.controllers[controllerPath]);
+            const routeKey = `${event.httpMethod} ${event.resource}`;
+            const routeConfig = (this as any)[event.httpMethod]?.[event.resource];
+            
+            if (!routeConfig) {
+                throw new Error(`Unregistered controller for route ${routeKey}`);
+            }
+            
+            const [controllerPath, handler] = routeConfig.split('|');
+            
+            if (!controllerPath || !handler) {
+                throw new Error(`Invalid route configuration for ${routeKey}: ${routeConfig}`);
+            }
+            
+            const controllerClass = this.controllers[controllerPath];
+            if (!controllerClass) {
+                throw new Error(`Controller class not found for path: ${controllerPath}`);
+            }
+            
+            const controller: any = await container.resolve(controllerClass);
+            
+            if (!controller) {
+                throw new Error(`Failed to resolve controller instance for: ${controllerPath}`);
+            }
+            
+            if (typeof controller[handler] !== 'function') {
+                throw new Error(`Method '${handler}' not found in controller '${controllerPath}' or is not a function`);
+            }
 
+            const result = await controller[handler](event);
+            
+            // Check if result is a FusionResponse instance
+            if (result instanceof FusionResponse) {
+                return result.toResponse();
+            }
+            
+            // Handle empty responses (undefined, null)
+            if (result === undefined || result === null) {
+                return {
+                    statusCode: 204, // No Content
+                    headers: {},
+                    body: ''
+                };
+            }
+            
+            // Default behavior for backward compatibility
             return {
                 statusCode: 200,
                 headers: {
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify(
-                    await controller[handler](event)
-                )
+                body: JSON.stringify(result)
             }
         } catch (err) {
-            console.error(err);
+            const error = err as any;
+            console.error('[FusionServer Error]', {
+                message: error.message,
+                stack: error.stack,
+                route: `${event.httpMethod} ${event.resource}`,
+                requestId: event.requestContext?.requestId,
+                timestamp: new Date().toISOString()
+            });
+            
             return {
-                statusCode: (err as any).code || 500,
+                statusCode: error.code || 500,
                 headers: {
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify(
-                    {
-                        message: (err as any).message
-                    }
-                )
+                body: JSON.stringify({
+                    message: error.message || 'Internal server error',
+                    requestId: event.requestContext?.requestId
+                })
             }
         }
     }
