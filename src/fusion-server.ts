@@ -4,10 +4,21 @@ import { registerServices } from "./core/registry";
 import { EvtListener } from './core/interfaces/evt-listener';
 import { FusionResponse } from './core/classes/fusion-response';
 
+export interface ICorsConfig {
+    enabled: boolean;
+    allowOrigins?: string[];
+    allowMethods?: string[];
+    allowHeaders?: string[];
+    exposeHeaders?: string[];
+    credentials?: boolean;
+    maxAge?: number;
+}
+
 export interface ICreateHandler {
     controllers: any[];
     dependencies?: InjectionToken<any>[];
     listeners?: InjectionToken<EvtListener>[];
+    cors?: ICorsConfig;
 }
 export class FusionServer {
     private controllers: any = {};
@@ -17,10 +28,14 @@ export class FusionServer {
     private PUT = {};
     private DELETE = {};
     private PATCH = {};
+    private corsConfig?: ICorsConfig;
 
     public createHandler(params: ICreateHandler) {
         this.validateHandlerParams(params);
-        
+
+        // Store CORS configuration
+        this.corsConfig = params.cors;
+
         // Register injectable services.
         registerServices();
         
@@ -153,11 +168,53 @@ export class FusionServer {
         }
     }
 
+    private applyCorsHeaders(headers: { [key: string]: string }, origin?: string): void {
+        if (!this.corsConfig?.enabled) return;
+
+        const config = this.corsConfig;
+
+        // Handle origin
+        if (config.allowOrigins) {
+            if (origin && config.allowOrigins.includes(origin)) {
+                headers['Access-Control-Allow-Origin'] = origin;
+            } else if (config.allowOrigins.includes('*')) {
+                headers['Access-Control-Allow-Origin'] = '*';
+            } else if (config.allowOrigins.length > 0) {
+                headers['Access-Control-Allow-Origin'] = config.allowOrigins[0];
+            }
+        }
+
+        // Handle methods
+        if (config.allowMethods && config.allowMethods.length > 0) {
+            headers['Access-Control-Allow-Methods'] = config.allowMethods.join(', ');
+        }
+
+        // Handle headers
+        if (config.allowHeaders && config.allowHeaders.length > 0) {
+            headers['Access-Control-Allow-Headers'] = config.allowHeaders.join(', ');
+        }
+
+        // Handle expose headers
+        if (config.exposeHeaders && config.exposeHeaders.length > 0) {
+            headers['Access-Control-Expose-Headers'] = config.exposeHeaders.join(', ');
+        }
+
+        // Handle credentials
+        if (config.credentials) {
+            headers['Access-Control-Allow-Credentials'] = 'true';
+        }
+
+        // Handle max age
+        if (config.maxAge !== undefined) {
+            headers['Access-Control-Max-Age'] = config.maxAge.toString();
+        }
+    }
+
     private async handleController(event: APIGatewayEvent) {
-        try { 
+        try {
             const routeKey = `${event.httpMethod} ${event.resource}`;
             const routeConfig = (this as any)[event.httpMethod]?.[event.resource];
-            
+
             if (!routeConfig) {
                 throw new Error(`Unregistered controller for route ${routeKey}`);
             }
@@ -184,27 +241,34 @@ export class FusionServer {
             }
 
             const result = await controller[handler](event);
-            
+            const origin = event.headers?.origin || event.headers?.Origin;
+
             // Check if result is a FusionResponse instance
             if (result instanceof FusionResponse) {
-                return result.toResponse();
+                const response = result.toResponse();
+                this.applyCorsHeaders(response.headers, origin);
+                return response;
             }
-            
+
             // Handle empty responses (undefined, null)
             if (result === undefined || result === null) {
+                const headers: { [key: string]: string } = {};
+                this.applyCorsHeaders(headers, origin);
                 return {
                     statusCode: 204, // No Content
-                    headers: {},
+                    headers,
                     body: ''
                 };
             }
-            
+
             // Default behavior for backward compatibility
+            const headers: { [key: string]: string } = {
+                'Content-Type': 'application/json'
+            };
+            this.applyCorsHeaders(headers, origin);
             return {
                 statusCode: 200,
-                headers: {
-                    'Content-Type': 'application/json'
-                },
+                headers,
                 body: JSON.stringify(result)
             }
         } catch (err) {
@@ -216,12 +280,16 @@ export class FusionServer {
                 requestId: event.requestContext?.requestId,
                 timestamp: new Date().toISOString()
             });
-            
+
+            const headers: { [key: string]: string } = {
+                'Content-Type': 'application/json'
+            };
+            const origin = event.headers?.origin || event.headers?.Origin;
+            this.applyCorsHeaders(headers, origin);
+
             return {
                 statusCode: error.code || 500,
-                headers: {
-                    'Content-Type': 'application/json'
-                },
+                headers,
                 body: JSON.stringify({
                     message: error.message || 'Internal server error',
                     requestId: event.requestContext?.requestId
