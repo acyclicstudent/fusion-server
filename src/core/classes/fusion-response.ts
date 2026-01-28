@@ -100,10 +100,15 @@ export class FusionResponse {
         return this.header('Cache-Control', 'no-cache, no-store, must-revalidate');
     }
 
-    // Method to get the final response object for Lambda
+    // Method to get the raw body (for direct Lambda responses like Bedrock, Cognito, etc.)
+    toObject(): any {
+        return this._body;
+    }
+
+    // Method to get the final response object for Lambda API Gateway
     toResponse(): { statusCode: number; headers: { [key: string]: string }; body: string } {
         let body: string;
-        
+
         if (this._body === null || this._body === undefined) {
             body = '';
         } else if (typeof this._body === 'string') {

@@ -110,12 +110,12 @@ describe('Decorators', () => {
 
     it('should set event metadata', () => {
       class TestListener {}
-      
+
       const listenerDecorator = Listener('user.created');
       listenerDecorator(TestListener);
 
       const metadata = Reflect.getMetadata('fusion:listener', TestListener);
-      expect(metadata).toBe('user.created');
+      expect(metadata).toEqual({ type: 'eventName', config: 'user.created' });
     });
   });
 
@@ -146,15 +146,15 @@ describe('Decorators', () => {
     it('should not interfere between controllers and listeners', () => {
       class TestController {}
       class TestListener {}
-      
+
       // Apply decorators
       Controller('/api')(TestController);
       Listener('test.event')(TestListener);
 
       // Verify separation
       expect(Reflect.getMetadata('fusion:route', TestController)).toBe('/api');
-      expect(Reflect.getMetadata('fusion:listener', TestListener)).toBe('test.event');
-      
+      expect(Reflect.getMetadata('fusion:listener', TestListener)).toEqual({ type: 'eventName', config: 'test.event' });
+
       expect(Reflect.getMetadata('fusion:listener', TestController)).toBeUndefined();
       expect(Reflect.getMetadata('fusion:route', TestListener)).toBeUndefined();
     });

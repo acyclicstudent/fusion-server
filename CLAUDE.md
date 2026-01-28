@@ -50,8 +50,185 @@ The framework implements Clean Architecture patterns with specific conventions:
 - Automatically registered for AWS Lambda API Gateway integration
 
 **Listeners:**
-- Decorated with `@Listener(event: string)` for event-driven architecture
+- Decorated with `@Listener(config)` for event-driven architecture
 - Must implement `EvtListener` interface with `handle()` method
+- Supports two routing modes:
+  1. **Event-name routing** (backward compatible):
+     ```ts
+     @Listener('user.created')
+     class UserListener implements EvtListener {
+       async handle(evt: any) {
+         // Handle event with evt.event === 'user.created'
+       }
+     }
+     ```
+  2. **Pattern matching** (for AWS service events):
+     ```ts
+     @Listener({
+       match: {
+         'Records[0].eventSource': 'aws:s3',
+         'Records[0].eventName': 'ObjectCreated:*',
+         'Records[0].s3.bucket.name': 'my-bucket'
+       }
+     })
+     class S3Listener implements EvtListener {
+       async handle(evt: any) {
+         // Handle S3 ObjectCreated events for my-bucket
+       }
+     }
+     ```
+
+**Listener Pattern Matching:**
+- Use dot notation paths to access nested properties: `'Records[0].s3.bucket.name'`
+- Pattern types:
+  - `'exact-value'` - Exact string match
+  - `'prefix:*'` - Wildcard suffix matching (e.g., `'ObjectCreated:*'`)
+  - `'*'` - Existence check (matches any non-null value)
+  - `['value1', 'value2']` - OR logic (matches if value equals any array element)
+- All patterns in a listener must match (AND logic)
+- Priority rules:
+  - Event-name takes absolute priority if `evt.event` exists
+  - First registered pattern listener wins if multiple patterns match
+  - Events without `httpMethod`/`resource` are routed to listener system
+
+**Listener Response Handling:**
+- **Plain objects**: Wrapped in `{success, matchType, body}` for backward compatibility
+- **FusionResponse**: Smart detection based on configuration:
+  - If only body is set (no custom headers/status) → Returns raw object (for Bedrock, Cognito, etc.)
+  - If custom headers or status are set → Returns API Gateway format `{statusCode, headers, body}`
+- This allows the same FusionResponse class to work for both direct Lambda invocations and HTTP-like responses
+
+**Examples:**
+
+*Direct object response (Bedrock, Cognito):*
+```ts
+@Listener({
+  match: {
+    'actionGroup': '*',
+    'apiPath': '/my-action'
+  }
+})
+class BedrockActionListener implements EvtListener {
+  async handle(evt: any) {
+    // FusionResponse with only body → returns raw object
+    return new FusionResponse({
+      messageVersion: '1.0',
+      response: {
+        actionGroup: evt.actionGroup,
+        apiPath: evt.apiPath,
+        httpStatusCode: 200,
+        responseBody: {
+          'application/json': {
+            body: JSON.stringify({ result: 'processed' })
+          }
+        }
+      }
+    });
+  }
+}
+```
+
+*HTTP-like response (custom headers/status):*
+```ts
+@Listener('webhook.received')
+class WebhookListener implements EvtListener {
+  async handle(evt: any) {
+    // FusionResponse with headers/status → returns API Gateway format
+    return new FusionResponse({ processed: true })
+      .status(202)
+      .header('X-Request-ID', evt.requestId);
+  }
+}
+```
+
+**Common AWS Event Patterns:**
+- **S3 Events:**
+  ```ts
+  @Listener({
+    match: {
+      'Records[0].eventSource': 'aws:s3',
+      'Records[0].eventName': 'ObjectCreated:*'
+    }
+  })
+  ```
+- **SQS Events:**
+  ```ts
+  @Listener({
+    match: {
+      'Records[0].eventSource': 'aws:sqs'
+    }
+  })
+  ```
+- **EventBridge Events:**
+  ```ts
+  @Listener({
+    match: {
+      'source': 'aws.ec2',
+      'detail-type': 'EC2 Instance State-change Notification'
+    }
+  })
+  ```
+- **Bedrock Agent Actions (with custom response):**
+  ```ts
+  @Listener({
+    match: {
+      'actionGroup': '*',
+      'apiPath': '/process-data'
+    }
+  })
+  class BedrockActionListener implements EvtListener {
+    async handle(evt: any) {
+      // Process the action
+      const result = processData(evt.parameters);
+
+      // Return Bedrock-specific response structure
+      return new FusionResponse({
+        messageVersion: '1.0',
+        response: {
+          actionGroup: evt.actionGroup,
+          apiPath: evt.apiPath,
+          httpMethod: evt.httpMethod,
+          httpStatusCode: 200,
+          responseBody: {
+            'application/json': {
+              body: JSON.stringify(result)
+            }
+          }
+        }
+      });
+    }
+  }
+  ```
+- **Cognito Pre-Token Generation:**
+  ```ts
+  @Listener({
+    match: {
+      'triggerSource': 'TokenGeneration_Authentication'
+    }
+  })
+  class CognitoTokenListener implements EvtListener {
+    async handle(evt: any) {
+      // Add custom claims
+      return new FusionResponse({
+        claimsOverrideDetails: {
+          claimsToAddOrOverride: {
+            'custom:role': 'admin',
+            'custom:tenant': evt.request.userAttributes['custom:tenant']
+          },
+          claimsToSuppress: []
+        }
+      });
+    }
+  }
+  ```
+- **Multi-source Listener:**
+  ```ts
+  @Listener({
+    match: {
+      'Records[0].eventSource': ['aws:s3', 'aws:sqs', 'aws:sns']
+    }
+  })
+  ```
 
 **Dependency Injection:**
 - Uses TSyringe container
