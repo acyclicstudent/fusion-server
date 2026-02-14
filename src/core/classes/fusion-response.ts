@@ -2,6 +2,7 @@ export class FusionResponse {
     private _statusCode: number = 200;
     private _headers: { [key: string]: string } = {};
     private _body: any = null;
+    private _isBase64Encoded: boolean = false;
 
     constructor(body?: any) {
         if (body !== undefined) {
@@ -39,6 +40,18 @@ export class FusionResponse {
     html(data: string): FusionResponse {
         this._body = data;
         this.header('Content-Type', 'text/html');
+        return this;
+    }
+
+    base64(encoded: boolean = true): FusionResponse {
+        this._isBase64Encoded = encoded;
+        return this;
+    }
+
+    binary(data: string, contentType: string): FusionResponse {
+        this._body = data;
+        this._isBase64Encoded = true;
+        this.header('Content-Type', contentType);
         return this;
     }
 
@@ -83,6 +96,29 @@ export class FusionResponse {
         return new FusionResponse({ message: message || 'Internal Server Error' }).status(500);
     }
 
+    // Binary file convenience methods
+    static pdf(base64Data: string): FusionResponse {
+        return new FusionResponse(base64Data)
+            .binary(base64Data, 'application/pdf');
+    }
+
+    static image(base64Data: string, type: 'png' | 'jpeg' | 'jpg' | 'gif' | 'webp' = 'png'): FusionResponse {
+        const mimeType = type === 'jpg' ? 'jpeg' : type;
+        return new FusionResponse(base64Data)
+            .binary(base64Data, `image/${mimeType}`);
+    }
+
+    static file(base64Data: string, contentType: string, filename?: string): FusionResponse {
+        const response = new FusionResponse(base64Data)
+            .binary(base64Data, contentType);
+
+        if (filename) {
+            response.header('Content-Disposition', `attachment; filename="${filename}"`);
+        }
+
+        return response;
+    }
+
     // CORS helper
     cors(origins: string[] = ['*'], methods: string[] = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH']): FusionResponse {
         return this
@@ -106,7 +142,7 @@ export class FusionResponse {
     }
 
     // Method to get the final response object for Lambda API Gateway
-    toResponse(): { statusCode: number; headers: { [key: string]: string }; body: string } {
+    toResponse(): { statusCode: number; headers: { [key: string]: string }; body: string; isBase64Encoded?: boolean } {
         let body: string;
 
         if (this._body === null || this._body === undefined) {
@@ -120,11 +156,17 @@ export class FusionResponse {
             }
         }
 
-        return {
+        const response: { statusCode: number; headers: { [key: string]: string }; body: string; isBase64Encoded?: boolean } = {
             statusCode: this._statusCode,
             headers: { ...this._headers },
             body
         };
+
+        if (this._isBase64Encoded) {
+            response.isBase64Encoded = true;
+        }
+
+        return response;
     }
 
     // Getters for internal use
@@ -138,5 +180,9 @@ export class FusionResponse {
 
     get body(): any {
         return this._body;
+    }
+
+    get isBase64Encoded(): boolean {
+        return this._isBase64Encoded;
     }
 }

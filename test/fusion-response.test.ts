@@ -229,4 +229,119 @@ describe('FusionResponse', () => {
       });
     });
   });
+
+  describe('Base64 Encoding', () => {
+    it('should set base64 encoding flag', () => {
+      const response = new FusionResponse('base64data').base64();
+
+      expect(response.isBase64Encoded).toBe(true);
+    });
+
+    it('should default to false for base64 encoding', () => {
+      const response = new FusionResponse('data');
+
+      expect(response.isBase64Encoded).toBe(false);
+    });
+
+    it('should include isBase64Encoded in toResponse when true', () => {
+      const base64Data = 'aGVsbG8gd29ybGQ=';
+      const response = new FusionResponse(base64Data)
+        .base64()
+        .toResponse();
+
+      expect(response).toEqual({
+        statusCode: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: base64Data,
+        isBase64Encoded: true
+      });
+    });
+
+    it('should not include isBase64Encoded in toResponse when false', () => {
+      const response = new FusionResponse('data').toResponse();
+
+      expect(response.isBase64Encoded).toBeUndefined();
+    });
+
+    it('should support binary method with base64 flag and content-type', () => {
+      const base64Data = 'aGVsbG8gd29ybGQ=';
+      const response = new FusionResponse().binary(base64Data, 'application/pdf');
+
+      expect(response.body).toBe(base64Data);
+      expect(response.isBase64Encoded).toBe(true);
+      expect(response.headers['Content-Type']).toBe('application/pdf');
+    });
+  });
+
+  describe('Binary File Convenience Methods', () => {
+    it('should create PDF response with correct content-type', () => {
+      const pdfData = 'JVBERi0xLjQK';
+      const response = FusionResponse.pdf(pdfData);
+
+      expect(response.body).toBe(pdfData);
+      expect(response.isBase64Encoded).toBe(true);
+      expect(response.headers['Content-Type']).toBe('application/pdf');
+    });
+
+    it('should create PNG image response', () => {
+      const imageData = 'iVBORw0KGgo=';
+      const response = FusionResponse.image(imageData, 'png');
+
+      expect(response.body).toBe(imageData);
+      expect(response.isBase64Encoded).toBe(true);
+      expect(response.headers['Content-Type']).toBe('image/png');
+    });
+
+    it('should create JPEG image response', () => {
+      const imageData = '/9j/4AAQSkZJRg==';
+      const response = FusionResponse.image(imageData, 'jpeg');
+
+      expect(response.body).toBe(imageData);
+      expect(response.isBase64Encoded).toBe(true);
+      expect(response.headers['Content-Type']).toBe('image/jpeg');
+    });
+
+    it('should handle jpg alias for jpeg', () => {
+      const imageData = '/9j/4AAQSkZJRg==';
+      const response = FusionResponse.image(imageData, 'jpg');
+
+      expect(response.headers['Content-Type']).toBe('image/jpeg');
+    });
+
+    it('should create generic file response with custom content-type', () => {
+      const fileData = 'base64encodeddata';
+      const response = FusionResponse.file(fileData, 'application/octet-stream');
+
+      expect(response.body).toBe(fileData);
+      expect(response.isBase64Encoded).toBe(true);
+      expect(response.headers['Content-Type']).toBe('application/octet-stream');
+    });
+
+    it('should add Content-Disposition header when filename is provided', () => {
+      const fileData = 'base64encodeddata';
+      const filename = 'document.pdf';
+      const response = FusionResponse.file(fileData, 'application/pdf', filename);
+
+      expect(response.headers['Content-Disposition']).toBe(`attachment; filename="${filename}"`);
+    });
+
+    it('should not add Content-Disposition header when filename is not provided', () => {
+      const fileData = 'base64encodeddata';
+      const response = FusionResponse.file(fileData, 'application/pdf');
+
+      expect(response.headers['Content-Disposition']).toBeUndefined();
+    });
+
+    it('should return proper Lambda response for binary file', () => {
+      const pdfData = 'JVBERi0xLjQK';
+      const response = FusionResponse.pdf(pdfData).toResponse();
+
+      expect(response).toEqual({
+        statusCode: 200,
+        headers: { 'Content-Type': 'application/pdf' },
+        body: pdfData,
+        isBase64Encoded: true
+      });
+    });
+  });
 });

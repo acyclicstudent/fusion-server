@@ -12,6 +12,7 @@ A powerful, TypeScript-first framework for building serverless applications on A
 - 🎯 **Decorator-based** - Express-like decorators for controllers and HTTP methods
 - 📡 **Event-driven** - Support for Lambda event listeners beyond HTTP
 - 🔧 **Advanced Response Control** - Flexible response handling with headers, status codes, and CORS
+- 📄 **Binary File Support** - Built-in base64 encoding for serving images, PDFs, and other binary files
 - ⚡ **AWS Lambda Optimized** - Built specifically for serverless deployments
 - 🧪 **Testing Ready** - Full TypeScript support with testing utilities
 - 📦 **Zero Configuration** - Works out of the box with sensible defaults
@@ -151,6 +152,16 @@ return FusionResponse.ok()
   .html('<h1>Hello</h1>');       // text/html
   .json({ message: 'Hello' });   // application/json
 
+// Binary files (base64 encoded)
+return FusionResponse.pdf(base64PdfData);
+return FusionResponse.image(base64ImageData, 'png');
+return FusionResponse.file(base64Data, 'application/zip', 'archive.zip');
+
+// Manual base64 encoding
+return new FusionResponse(base64Data)
+  .base64()
+  .header('Content-Type', 'application/octet-stream');
+
 // Convenience methods
 return FusionResponse.created(user);        // 201
 return FusionResponse.accepted(data);       // 202
@@ -200,6 +211,148 @@ export const handler = app.createHandler({
   controllers: [UserController],
   listeners: [UserCreatedListener]
 });
+```
+
+## 🚨 Exception Handling
+
+The framework provides built-in HTTP exceptions for common error scenarios:
+
+```typescript
+import {
+  ValidationException,
+  UnauthorizedException,
+  ForbiddenException,
+  ResourceNotFoundException,
+  ConflictException,
+  UnprocessableEntityException,
+  TooManyRequestsException,
+  InternalServerErrorException,
+  BadGatewayException,
+  ServiceUnavailableException
+} from '@fusion-framework/server';
+
+@Controller('/api')
+export class ApiController {
+  @Post('/login')
+  async login(event: APIGatewayEvent) {
+    const { email, password } = JSON.parse(event.body || '{}');
+
+    if (!email || !password) {
+      throw new ValidationException('Email and password are required');
+    }
+
+    const user = await this.userService.findByEmail(email);
+
+    if (!user) {
+      throw new UnauthorizedException('Invalid credentials');
+    }
+
+    return FusionResponse.ok({ token: user.token });
+  }
+
+  @Get('/admin/users')
+  async getAdminUsers(event: APIGatewayEvent) {
+    const user = await this.authService.validateToken(event);
+
+    if (!user) {
+      throw new UnauthorizedException('Authentication required');
+    }
+
+    if (user.role !== 'admin') {
+      throw new ForbiddenException('Admin access required');
+    }
+
+    return FusionResponse.ok(await this.userService.getAllUsers());
+  }
+
+  @Post('/users')
+  async createUser(event: APIGatewayEvent) {
+    const userData = JSON.parse(event.body || '{}');
+
+    const existingUser = await this.userService.findByEmail(userData.email);
+
+    if (existingUser) {
+      throw new ConflictException('Email already registered');
+    }
+
+    const user = await this.userService.create(userData);
+    return FusionResponse.created(user);
+  }
+
+  @Post('/process')
+  async processData(event: APIGatewayEvent) {
+    const data = JSON.parse(event.body || '{}');
+
+    // Validation passed, but business rules failed
+    if (data.age < 18 && data.requiresParentalConsent === false) {
+      throw new UnprocessableEntityException('Parental consent required for minors');
+    }
+
+    return FusionResponse.ok(await this.processService.process(data));
+  }
+
+  @Get('/data')
+  async getData(event: APIGatewayEvent) {
+    const userId = event.requestContext.authorizer?.userId;
+
+    if (await this.rateLimiter.isRateLimited(userId)) {
+      throw new TooManyRequestsException('Rate limit exceeded. Try again in 1 minute');
+    }
+
+    return FusionResponse.ok(await this.dataService.getData());
+  }
+
+  @Get('/proxy/:service')
+  async proxyService(event: APIGatewayEvent) {
+    const service = event.pathParameters?.service;
+
+    try {
+      const response = await this.httpClient.get(`https://api.${service}.com/data`);
+      return FusionResponse.ok(response.data);
+    } catch (error) {
+      if (error.code === 'ECONNREFUSED') {
+        throw new BadGatewayException(`Unable to connect to ${service} service`);
+      }
+      throw error;
+    }
+  }
+
+  @Get('/health')
+  async healthCheck() {
+    const isDbConnected = await this.db.ping();
+
+    if (!isDbConnected) {
+      throw new ServiceUnavailableException('Database is unavailable');
+    }
+
+    return FusionResponse.ok({ status: 'healthy' });
+  }
+}
+```
+
+### Creating Custom Exceptions
+
+```typescript
+import { FusionException } from '@fusion-framework/server';
+
+// Custom exception with specific HTTP code
+export class PaymentRequiredException extends FusionException {
+  constructor(message: string = 'Payment Required') {
+    super(402, message);
+  }
+}
+
+// Usage
+@Post('/premium-feature')
+async accessPremiumFeature(event: APIGatewayEvent) {
+  const user = await this.authService.getCurrentUser(event);
+
+  if (!user.isPremium) {
+    throw new PaymentRequiredException('Upgrade to premium to access this feature');
+  }
+
+  return FusionResponse.ok({ data: 'Premium content' });
+}
 ```
 
 ## 🧪 Testing
@@ -257,14 +410,20 @@ export class UserController {
     try {
       const userData = JSON.parse(event.body || '{}');
       const user = await this.ucExecutor.execute(CreateUserUC, userData);
-      
+
       return FusionResponse.created(user)
         .header('Location', `/users/${user.id}`)
         .cors(['*']);
-        
+
     } catch (error) {
       if (error instanceof ValidationException) {
         return FusionResponse.badRequest(error.message);
+      }
+      if (error instanceof ConflictException) {
+        return FusionResponse.conflict(error.message);
+      }
+      if (error instanceof UnauthorizedException) {
+        return FusionResponse.unauthorized(error.message);
       }
       throw error; // Let framework handle 500 errors
     }
@@ -291,6 +450,26 @@ export class UserController {
     const id = event.pathParameters?.id;
     await this.ucExecutor.execute(DeleteUserUC, id);
     return FusionResponse.noContent();
+  }
+
+  @Get('/:id/avatar')
+  async getUserAvatar(event: APIGatewayEvent) {
+    const id = event.pathParameters?.id;
+    const avatar = await this.ucExecutor.execute(GetUserAvatarUC, id);
+
+    // Return binary image data (base64 encoded)
+    return FusionResponse.image(avatar.base64Data, 'png')
+      .cache(3600)
+      .cors(['*']);
+  }
+
+  @Get('/:id/report')
+  async getUserReport(event: APIGatewayEvent) {
+    const id = event.pathParameters?.id;
+    const pdfData = await this.ucExecutor.execute(GenerateUserReportUC, id);
+
+    // Return PDF file with download filename
+    return FusionResponse.file(pdfData, 'application/pdf', `user-${id}-report.pdf`);
   }
 }
 
@@ -350,7 +529,15 @@ npm run analyze
 - `UCExecutor` - Execute use cases with DI
 - `FusionException` - Base exception with HTTP status codes
 - `ValidationException` - 400 Bad Request exception
+- `UnauthorizedException` - 401 Unauthorized exception
+- `ForbiddenException` - 403 Forbidden exception
 - `ResourceNotFoundException` - 404 Not Found exception
+- `ConflictException` - 409 Conflict exception
+- `UnprocessableEntityException` - 422 Unprocessable Entity exception
+- `TooManyRequestsException` - 429 Too Many Requests exception
+- `InternalServerErrorException` - 500 Internal Server Error exception
+- `BadGatewayException` - 502 Bad Gateway exception
+- `ServiceUnavailableException` - 503 Service Unavailable exception
 
 ## 🤝 Contributing
 

@@ -239,7 +239,17 @@ class WebhookListener implements EvtListener {
 
 **Exception Handling:**
 - Extend `FusionException` for custom exceptions with HTTP status codes
-- Built-in exceptions: `ValidationException`, `ResourceNotFoundException`
+- Built-in exceptions:
+  - `ValidationException` (400) - Input validation errors
+  - `UnauthorizedException` (401) - Authentication required
+  - `ForbiddenException` (403) - Insufficient permissions
+  - `ResourceNotFoundException` (404) - Resource not found
+  - `ConflictException` (409) - Resource conflicts
+  - `UnprocessableEntityException` (422) - Semantic validation errors
+  - `TooManyRequestsException` (429) - Rate limiting
+  - `InternalServerErrorException` (500) - Internal server errors
+  - `BadGatewayException` (502) - Gateway/proxy errors
+  - `ServiceUnavailableException` (503) - Service temporarily unavailable
 
 **Response Handling:**
 - Controllers can return plain objects (auto JSON with 200 status) for backward compatibility
@@ -261,6 +271,16 @@ class WebhookListener implements EvtListener {
     .status(201)
     .header('Location', `/users/${id}`)
     .cache(3600);
+
+  // Binary file responses (base64 encoded)
+  return FusionResponse.pdf(base64PdfData);
+  return FusionResponse.image(base64ImageData, 'png');
+  return FusionResponse.file(base64Data, 'application/zip', 'archive.zip');
+
+  // Manual base64 encoding
+  return new FusionResponse(base64Data)
+    .base64()
+    .header('Content-Type', 'application/octet-stream');
   ```
 
 ### Project Structure

@@ -206,6 +206,219 @@ class OrderController {
 }
 ```
 
+## 4. Soporte de Archivos Binarios (Base64)
+
+El framework ahora soporta la devolución de archivos binarios codificados en base64, perfecto para imágenes, PDFs, y otros archivos.
+
+### Métodos de conveniencia para archivos comunes
+
+```typescript
+@Controller('/files')
+class FileController {
+  @Get('/invoice/:id/pdf')
+  async getInvoicePdf(event: APIGatewayEvent) {
+    const invoiceId = event.pathParameters?.id;
+
+    // Generar o recuperar PDF en base64
+    const pdfBase64 = await this.generateInvoicePdf(invoiceId);
+
+    // Devolver PDF con nombre de archivo sugerido
+    return FusionResponse.pdf(pdfBase64);
+  }
+
+  @Get('/user/:id/avatar')
+  async getUserAvatar(event: APIGatewayEvent) {
+    const userId = event.pathParameters?.id;
+    const avatarBase64 = await this.getAvatar(userId);
+
+    // Devolver imagen PNG
+    return FusionResponse.image(avatarBase64, 'png')
+      .cache(3600) // Cachear por 1 hora
+      .cors(['*']);
+  }
+
+  @Get('/user/:id/photo')
+  async getUserPhoto(event: APIGatewayEvent) {
+    const userId = event.pathParameters?.id;
+    const photoBase64 = await this.getPhoto(userId);
+
+    // Soporta: 'png', 'jpeg', 'jpg', 'gif', 'webp'
+    return FusionResponse.image(photoBase64, 'jpeg');
+  }
+
+  @Get('/reports/:id/download')
+  async downloadReport(event: APIGatewayEvent) {
+    const reportId = event.pathParameters?.id;
+    const reportData = await this.generateReport(reportId);
+
+    // Archivo genérico con Content-Disposition para descarga
+    return FusionResponse.file(
+      reportData,
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      `report-${reportId}.xlsx`
+    );
+  }
+}
+```
+
+### Método manual para casos especiales
+
+```typescript
+@Controller('/custom')
+class CustomFileController {
+  @Get('/binary/:type')
+  async getCustomBinary(event: APIGatewayEvent) {
+    const fileType = event.pathParameters?.type;
+    const binaryData = await this.getBinaryData(fileType);
+
+    // Control manual completo
+    return new FusionResponse(binaryData)
+      .base64() // Marca la respuesta como base64
+      .header('Content-Type', 'application/octet-stream')
+      .header('Content-Disposition', 'attachment; filename="data.bin"')
+      .cache(7200);
+  }
+
+  @Get('/zip/:archive')
+  async getZipFile(event: APIGatewayEvent) {
+    const archiveName = event.pathParameters?.archive;
+    const zipBase64 = await this.createZipArchive(archiveName);
+
+    return new FusionResponse(zipBase64)
+      .binary(zipBase64, 'application/zip')
+      .header('Content-Disposition', `attachment; filename="${archiveName}.zip"`);
+  }
+}
+```
+
+### Ejemplo con S3
+
+```typescript
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+
+@Controller('/media')
+class MediaController {
+  constructor(
+    private s3Client: S3Client,
+    private ucExecutor: UCExecutor
+  ) {}
+
+  @Get('/images/:key')
+  async getImage(event: APIGatewayEvent) {
+    const key = event.pathParameters?.key;
+
+    // Obtener imagen de S3
+    const command = new GetObjectCommand({
+      Bucket: 'my-bucket',
+      Key: key
+    });
+
+    const response = await this.s3Client.send(command);
+    const buffer = await response.Body?.transformToByteArray();
+
+    if (!buffer) {
+      return FusionResponse.notFound('Image not found');
+    }
+
+    // Convertir a base64
+    const base64Image = Buffer.from(buffer).toString('base64');
+
+    // Determinar tipo de imagen basado en la extensión
+    const imageType = key.endsWith('.png') ? 'png' : 'jpeg';
+
+    return FusionResponse.image(base64Image, imageType)
+      .cache(86400) // Cachear por 24 horas
+      .cors(['*']);
+  }
+
+  @Get('/documents/:id')
+  async getDocument(event: APIGatewayEvent) {
+    const docId = event.pathParameters?.id;
+
+    // Usar caso de uso para obtener documento
+    const document = await this.ucExecutor.execute(GetDocumentUC, docId);
+
+    if (!document) {
+      return FusionResponse.notFound('Document not found');
+    }
+
+    // Retornar PDF con nombre personalizado
+    return FusionResponse.file(
+      document.base64Data,
+      'application/pdf',
+      `${document.name}.pdf`
+    ).cors(['*']);
+  }
+}
+```
+
+### Generación dinámica de imágenes
+
+```typescript
+import { createCanvas } from 'canvas';
+
+@Controller('/dynamic')
+class DynamicImageController {
+  @Get('/badge/:text')
+  async generateBadge(event: APIGatewayEvent) {
+    const text = event.pathParameters?.text || 'Badge';
+
+    // Generar imagen con canvas
+    const canvas = createCanvas(200, 50);
+    const ctx = canvas.getContext('2d');
+
+    // Dibujar badge
+    ctx.fillStyle = '#007bff';
+    ctx.fillRect(0, 0, 200, 50);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 20px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText(text, 100, 32);
+
+    // Convertir a base64
+    const imageBase64 = canvas.toBuffer('image/png').toString('base64');
+
+    return FusionResponse.image(imageBase64, 'png')
+      .cache(3600)
+      .cors(['*']);
+  }
+
+  @Get('/qr/:data')
+  async generateQR(event: APIGatewayEvent) {
+    const data = decodeURIComponent(event.pathParameters?.data || '');
+
+    // Generar QR code (usando librería como 'qrcode')
+    const qrBase64 = await this.generateQRCode(data);
+
+    return FusionResponse.image(qrBase64, 'png')
+      .noCache() // QR dinámicos no deberían cachearse
+      .cors(['*']);
+  }
+}
+```
+
+### Tipos de archivos soportados
+
+El framework incluye helpers para los tipos de archivo más comunes:
+
+| Método | Content-Type | Uso típico |
+|--------|-------------|------------|
+| `.pdf(data)` | `application/pdf` | Facturas, reportes, documentos |
+| `.image(data, 'png')` | `image/png` | Capturas, gráficos, iconos |
+| `.image(data, 'jpeg')` | `image/jpeg` | Fotos, imágenes comprimidas |
+| `.image(data, 'gif')` | `image/gif` | Animaciones |
+| `.image(data, 'webp')` | `image/webp` | Imágenes optimizadas web |
+| `.file(data, type)` | Custom | Cualquier tipo de archivo |
+| `.binary(data, type)` | Custom | Control manual completo |
+
+### Notas importantes sobre Base64
+
+1. **API Gateway**: El campo `isBase64Encoded: true` se incluye automáticamente en la respuesta Lambda
+2. **Tamaño**: Lambda tiene un límite de 6MB para respuestas síncronas
+3. **Performance**: Para archivos grandes, considera usar S3 con URLs pre-firmadas
+4. **Cache**: Usa `.cache(seconds)` para reducir carga en archivos estáticos
+5. **CORS**: Recuerda añadir `.cors()` si los archivos se acceden desde navegador
+
 ## Comparación de Enfoques
 
 | Escenario | Original | FusionResponse |
@@ -217,3 +430,5 @@ class OrderController {
 | Cache | ❌ | `.cache(3600)` |
 | Respuesta vacía | `return null` → 204 | `FusionResponse.noContent()` |
 | Errores | Throw exception | `FusionResponse.badRequest(msg)` |
+| Archivos binarios | ❌ | `FusionResponse.pdf(base64Data)` |
+| Imágenes | ❌ | `FusionResponse.image(base64Data, 'png')` |
