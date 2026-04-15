@@ -5,6 +5,11 @@
 
 A powerful, TypeScript-first framework for building serverless applications on AWS Lambda with clean architecture principles, dependency injection, and advanced response handling.
 
+> **Using an LLM assistant?** Start with [`llms.txt`](./llms.txt) (curated index)
+> or [`llms-full.txt`](./llms-full.txt) (complete reference). Those files are
+> the authoritative source for conventions like path syntax (`{id}` not `:id`)
+> and the use-case / permission patterns.
+
 ## ✨ Features
 
 - 🏗️ **Clean Architecture** - Built-in use case pattern with proper separation of concerns
@@ -50,7 +55,7 @@ export class UserController {
       .header('Location', `/users/${user.id}`);
   }
 
-  @Get('/:id')
+  @Get('/{id}')
   async getUser(event: APIGatewayEvent) {
     const user = await this.findUser(event.pathParameters?.id);
     
@@ -104,22 +109,23 @@ export class CreateUserUC extends UC {
 ### Use in Controller
 
 ```typescript
-import { Controller, Post, UCExecutor } from '@fusion-framework/server';
+import { Controller, Post, FusionResponse, UCExecutor, Executor } from '@fusion-framework/server';
 
 @Controller('/users')
 export class UserController {
-  constructor(private ucExecutor: UCExecutor) {}
+  // @Executor() is the idiomatic way to inject UCExecutor.
+  // Never inject a UC directly — always run it through UCExecutor.
+  constructor(@Executor() private ucExecutor: UCExecutor) {}
 
   @Post('/')
   async createUser(event: APIGatewayEvent) {
     const request = JSON.parse(event.body || '{}');
-    
-    try {
-      const user = await this.ucExecutor.execute(CreateUserUC, request);
-      return FusionResponse.created(user);
-    } catch (error) {
-      return FusionResponse.badRequest(error.message);
-    }
+
+    // No need to wrap in try/catch — any FusionException thrown inside
+    // the use case (ValidationException, ConflictException, etc.) is
+    // caught by the framework and mapped to its `.code` status.
+    const user = await this.ucExecutor.execute(CreateUserUC, request);
+    return FusionResponse.created(user);
   }
 }
 ```
@@ -146,11 +152,10 @@ return new FusionResponse(data)
 return FusionResponse.ok(data)
   .cors(['https://example.com'], ['GET', 'POST']);
 
-// Different content types
-return FusionResponse.ok()
-  .text('Hello World');           // text/plain
-  .html('<h1>Hello</h1>');       // text/html
-  .json({ message: 'Hello' });   // application/json
+// Different content types (each one sets the body and Content-Type)
+return new FusionResponse().text('Hello World');       // text/plain
+return new FusionResponse().html('<h1>Hello</h1>');    // text/html
+return new FusionResponse().json({ message: 'Hello' }); // application/json
 
 // Binary files (base64 encoded)
 return FusionResponse.pdf(base64PdfData);
@@ -192,26 +197,124 @@ async cleanup() {
 
 ## 📡 Event Listeners
 
-Handle non-HTTP Lambda events:
+Handle non-HTTP Lambda events (SQS, S3, EventBridge, Cognito triggers,
+Bedrock hooks, custom invocations, etc.). Two dispatch strategies.
+
+### 1. Event-name listeners (O(1) lookup)
+
+Use when the event payload contains an `event` key you control — e.g.
+internal pub/sub or direct Lambda invocations.
 
 ```typescript
 import { Listener, EvtListener } from '@fusion-framework/server';
 
 @Listener('user.created')
 export class UserCreatedListener implements EvtListener {
-  async handle(event: any) {
-    console.log('User created:', event.data);
-    // Send welcome email, update analytics, etc.
+  async handle(evt: { event: 'user.created'; data: { userId: string } }) {
+    // ...
     return { processed: true };
   }
 }
 
-// Register with handler
+// Invoke with: { event: 'user.created', data: { userId: '1' } }
+```
+
+### 2. Pattern-matched listeners (for events you don't control)
+
+Use when events come from AWS services (SQS, S3, EventBridge, …) where
+you match on structural fields. The first registered pattern that matches
+wins. Patterns use dot-notation + bracket indexing into the event.
+
+```typescript
+import { Listener, EvtListener } from '@fusion-framework/server';
+
+// SQS trigger on a specific queue
+@Listener({
+  patterns: {
+    'Records[0].eventSource': 'aws:sqs',
+    'Records[0].eventSourceARN': /:my-queue$/,   // RegExp supported
+  },
+})
+export class MyQueueListener implements EvtListener {
+  async handle(evt: any) {
+    for (const record of evt.Records) { /* ... */ }
+    return { processed: evt.Records.length };
+  }
+}
+
+// S3 object created
+@Listener({
+  patterns: {
+    'Records[0].eventSource': 'aws:s3',
+    'Records[0].eventName': /^ObjectCreated:/,
+  },
+})
+export class S3UploadListener implements EvtListener { /* ... */ }
+
+// Cognito pre-token generation trigger
+@Listener({
+  patterns: { triggerSource: 'TokenGeneration_Authentication' },
+})
+export class CognitoPreTokenListener implements EvtListener { /* ... */ }
+```
+
+Pattern values can be:
+
+- **String** — equality match
+- **RegExp** — regex test against the string at that path
+- **Function** `(value) => boolean` — custom predicate
+
+All patterns in the `patterns` object must match for the listener to fire.
+
+### Registration
+
+```typescript
 export const handler = app.createHandler({
   controllers: [UserController],
-  listeners: [UserCreatedListener]
+  listeners: [UserCreatedListener, MyQueueListener, S3UploadListener],
 });
 ```
+
+### Listener return shape
+
+How a listener's return value is converted into the Lambda response
+depends on what it returns:
+
+| Listener returns | Wrapped Lambda response |
+|---|---|
+| `FusionResponse` with custom headers **or** non-200 status | Full API Gateway shape: `{ statusCode, headers, body, isBase64Encoded? }` |
+| `FusionResponse` with default 200 + no custom headers | Raw body only (`.toObject()`) — for callers that expect a plain object back (Cognito triggers, Bedrock hooks, step functions, …) |
+| Any other value (object, string, number, void) | `{ success: true, matchType, body: <your return value> }` where `matchType` is `'eventName'` or `'pattern'` |
+| Throws | `{ success: false, body: { message, event } }` — errors are caught and logged, never rethrown |
+
+**Practical guidance:**
+
+- **Cognito / Bedrock / EventBridge targets** expect a specific object
+  shape back. Return a `FusionResponse` with that shape and no status
+  change — Fusion will unwrap it so the AWS service receives the raw
+  object:
+  ```typescript
+  @Listener({ patterns: { triggerSource: 'TokenGeneration_Authentication' } })
+  async handle(evt) {
+    evt.response = { claimsOverrideDetails: { ... } };
+    return FusionResponse.ok(evt);  // AWS Cognito receives `evt` directly
+  }
+  ```
+- **SQS / S3 / EventBridge ingestion** (no response expected) — return
+  a plain summary object. It will be wrapped as `{ success, matchType, body }`,
+  useful for CloudWatch logs but irrelevant to the source service.
+- **If you need an API-Gateway-like HTTP response from a listener** (rare,
+  but possible when an internal service invokes the Lambda expecting HTTP
+  shape), return a `FusionResponse` with a non-200 status OR with custom
+  headers — Fusion then emits the full API Gateway response format.
+
+### Dispatch order
+
+For an incoming event, Fusion checks in order:
+
+1. `evt.event` (string) exists AND matches a `@Listener(eventName)` → dispatch (O(1)).
+2. Otherwise, iterate registered pattern listeners; first full match wins.
+3. No match → error response with the event keys for debugging.
 
 ## 🚨 Exception Handling
 
@@ -302,7 +405,7 @@ export class ApiController {
     return FusionResponse.ok(await this.dataService.getData());
   }
 
-  @Get('/proxy/:service')
+  @Get('/proxy/{service}')
   async proxyService(event: APIGatewayEvent) {
     const service = event.pathParameters?.service;
 
@@ -355,24 +458,117 @@ async accessPremiumFeature(event: APIGatewayEvent) {
 }
 ```
 
+## 🔒 Permissions & Auth
+
+Declarative permission checks via decorator. The framework does not
+assume where permissions come from in the event — you register a
+resolver that knows your auth setup (Cognito claims, custom Lambda
+authorizer context, signed header, DB lookup, etc.).
+
+### Enforcing permissions on a route
+
+```typescript
+import {
+  Controller, Get, Post, FusionResponse,
+  RequirePermission, ResolveAuth, getAuthContext,
+} from '@fusion-framework/server';
+
+@Controller('/operations')
+export class OperationsController {
+  @Get('/{id}')
+  @RequirePermission('operations:read:own')   // all mode (default)
+  async getOne(event: APIGatewayEvent) {
+    const auth = getAuthContext(event);        // attached by decorator
+    return FusionResponse.ok({ id: event.pathParameters!.id, userId: auth?.userId });
+  }
+
+  @Post('/{id}/assign')
+  @RequirePermission('admin:*', 'operations:assign:area', { mode: 'any' })
+  async assign(event: APIGatewayEvent) { /* ... */ }
+
+  @Get('/public')
+  @ResolveAuth()   // attach auth context if present, don't enforce
+  async publicFeed(event: APIGatewayEvent) {
+    const auth = getAuthContext(event);
+    return auth ? personalizedFeed(auth.userId) : anonymousFeed();
+  }
+}
+```
+
+### Permission syntax
+
+Colon-separated tokens (`resource:action:scope`) with per-segment
+wildcards:
+
+- `operations:read:own` — read own operations
+- `operations:*:area` — any action on operations in caller's area
+- `*` in `granted` — matches anything
+
+`mode: 'all'` (default) requires every listed permission; `mode: 'any'`
+requires at least one. Denied responses return a 403 `FusionResponse`
+with `{ message: 'Forbidden', required, mode }`. Customize via
+`onDenied`:
+
+```typescript
+@RequirePermission('ops:delete:*', {
+  onDenied: ({ required }) =>
+    new FusionResponse({ code: 'NO_PERM', required }).status(403),
+})
+```
+
+### Registering an auth resolver
+
+Register during bootstrap, before `app.createHandler(...)`:
+
+```typescript
+import {
+  container, AUTH_CONTEXT_RESOLVER, IAuthContextResolver, AuthContext,
+} from '@fusion-framework/server';
+import { APIGatewayEvent } from 'aws-lambda';
+
+class MyCustomAuthResolver implements IAuthContextResolver {
+  resolve(event: APIGatewayEvent): AuthContext {
+    const auth = (event.requestContext as any)?.authorizer ?? {};
+    return {
+      userId: auth.userId,
+      permissions: (auth.permissions ?? '').split(',').filter(Boolean),
+      roles: JSON.parse(auth.roles ?? '[]'),
+      areas: JSON.parse(auth.areas ?? '[]'),
+    };
+  }
+}
+
+container.register(AUTH_CONTEXT_RESOLVER, { useClass: MyCustomAuthResolver });
+```
+
+If no resolver is registered, a default falls back to reading
+Cognito-style claims from `event.requestContext.authorizer.claims` (or
+`.jwt.claims` for HTTP API v2). Resolvers can be async; the decorator
+awaits them.
+
 ## 🧪 Testing
 
 ```typescript
-import { container } from '@fusion-framework/server';
+import 'reflect-metadata';
+import { container, UCExecutor } from '@fusion-framework/server';
 import { CreateUserUC } from '../use-cases/CreateUserUC';
 
 describe('CreateUserUC', () => {
-  beforeEach(() => {
-    container.clearInstances();
-  });
+  afterEach(() => container.reset());
 
   it('should create user successfully', async () => {
     // Mock dependencies
     const mockRepo = { create: jest.fn().mockResolvedValue({ id: 1 }) };
     container.register('UserRepository', { useValue: mockRepo });
 
-    const useCase = container.resolve(CreateUserUC);
-    const result = await useCase.execute({ name: 'John', email: 'john@example.com' });
+    // Run through UCExecutor — the same entry point controllers use.
+    // Never call `container.resolve(CreateUserUC).execute(...)` directly;
+    // UCs are always executed via UCExecutor.
+    const executor = new UCExecutor();
+    const result = await executor.execute(CreateUserUC, {
+      name: 'John',
+      email: 'john@example.com',
+    });
 
     expect(result.id).toBe(1);
     expect(mockRepo.create).toHaveBeenCalled();
@@ -384,75 +580,57 @@ describe('CreateUserUC', () => {
 
 ```typescript
 // user.controller.ts
-import { 
+import {
   Controller, Get, Post, Put, Delete,
-  FusionResponse, UCExecutor, Stage
+  FusionResponse, UCExecutor, Executor, Stage,
+  RequirePermission,
 } from '@fusion-framework/server';
 
 @Controller('/users')
 export class UserController {
   constructor(
-    private ucExecutor: UCExecutor,
+    @Executor() private ucExecutor: UCExecutor,
     @Stage() private stage: string
   ) {}
 
+  // No try/catch needed — any FusionException thrown by a use case
+  // (Validation, Conflict, ResourceNotFound, …) is caught by the
+  // framework and mapped to its `.code` status automatically.
+
   @Get('/')
+  @RequirePermission('users:read:*')
   async listUsers(event: APIGatewayEvent) {
     const users = await this.ucExecutor.execute(ListUsersUC);
-    
     return FusionResponse.ok(users)
-      .cors(['*'])
       .cache(this.stage === 'prod' ? 300 : 0);
   }
 
   @Post('/')
+  @RequirePermission('users:create:*')
   async createUser(event: APIGatewayEvent) {
-    try {
-      const userData = JSON.parse(event.body || '{}');
-      const user = await this.ucExecutor.execute(CreateUserUC, userData);
-
-      return FusionResponse.created(user)
-        .header('Location', `/users/${user.id}`)
-        .cors(['*']);
-
-    } catch (error) {
-      if (error instanceof ValidationException) {
-        return FusionResponse.badRequest(error.message);
-      }
-      if (error instanceof ConflictException) {
-        return FusionResponse.conflict(error.message);
-      }
-      if (error instanceof UnauthorizedException) {
-        return FusionResponse.unauthorized(error.message);
-      }
-      throw error; // Let framework handle 500 errors
-    }
+    const userData = JSON.parse(event.body || '{}');
+    const user = await this.ucExecutor.execute(CreateUserUC, userData);
+    return FusionResponse.created(user)
+      .header('Location', `/users/${user.id}`);
   }
 
-  @Put('/:id')
+  @Put('/{id}')
+  @RequirePermission('users:update:*')
   async updateUser(event: APIGatewayEvent) {
     const id = event.pathParameters?.id;
     const updates = JSON.parse(event.body || '{}');
-    
-    try {
-      const user = await this.ucExecutor.execute(UpdateUserUC, id, updates);
-      return FusionResponse.ok(user);
-    } catch (error) {
-      if (error instanceof ResourceNotFoundException) {
-        return FusionResponse.notFound('User not found');
-      }
-      throw error;
-    }
+    const user = await this.ucExecutor.execute(UpdateUserUC, id, updates);
+    return FusionResponse.ok(user);
   }
 
-  @Delete('/:id')
+  @Delete('/{id}')
   async deleteUser(event: APIGatewayEvent) {
     const id = event.pathParameters?.id;
     await this.ucExecutor.execute(DeleteUserUC, id);
     return FusionResponse.noContent();
   }
 
-  @Get('/:id/avatar')
+  @Get('/{id}/avatar')
   async getUserAvatar(event: APIGatewayEvent) {
     const id = event.pathParameters?.id;
     const avatar = await this.ucExecutor.execute(GetUserAvatarUC, id);
@@ -463,7 +641,7 @@ export class UserController {
       .cors(['*']);
   }
 
-  @Get('/:id/report')
+  @Get('/{id}/report')
   async getUserReport(event: APIGatewayEvent) {
     const id = event.pathParameters?.id;
     const pdfData = await this.ucExecutor.execute(GenerateUserReportUC, id);
@@ -474,13 +652,29 @@ export class UserController {
 }
 
 // handler.ts
-import { app } from '@fusion-framework/server';
+import 'reflect-metadata';   // must be imported first, once
+import {
+  app, container, AUTH_CONTEXT_RESOLVER,
+} from '@fusion-framework/server';
 import { UserController } from './controllers/user.controller';
 import { EmailListener } from './listeners/email.listener';
+import { MyCustomAuthResolver } from './auth/resolver';
+
+// Register custom auth resolver BEFORE createHandler so @RequirePermission
+// picks it up. Without this, the default Cognito-claims resolver is used.
+container.register(AUTH_CONTEXT_RESOLVER, { useClass: MyCustomAuthResolver });
 
 export const handler = app.createHandler({
   controllers: [UserController],
-  listeners: [EmailListener]
+  listeners: [EmailListener],
+  cors: {
+    enabled: true,
+    allowOrigins: ['https://app.example.com'],
+    allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
+    allowHeaders: ['Content-Type', 'Authorization'],
+    credentials: true,
+    maxAge: 600,
+  },
 });
 ```
 
@@ -510,17 +704,17 @@ npm run analyze
 
 ### Decorators
 
-- `@Controller(path)` - Define a controller with base path
-- `@Get(path)` - Handle GET requests
-- `@Post(path)` - Handle POST requests  
-- `@Put(path)` - Handle PUT requests
-- `@Delete(path)` - Handle DELETE requests
-- `@Patch(path)` - Handle PATCH requests
-- `@UseCase()` - Mark a class as a use case
-- `@Injectable()` - Mark a class as injectable service
-- `@Listener(event)` - Handle custom events
-- `@Stage()` - Inject deployment stage
-- `@Inject(token)` - Explicit dependency injection
+- `@Controller(path)` — Define a controller with base path. Use `{id}`
+  for path params, not `:id`.
+- `@Get(path)` / `@Post(path)` / `@Put(path)` / `@Patch(path)` / `@Delete(path)` — HTTP method handlers.
+- `@UseCase()` — Mark a class as a use case (extends `UC`, executed via `UCExecutor`).
+- `@Injectable(token?)` — Mark a class as an injectable service.
+- `@Listener(eventNameOrConfig)` — Event-name or pattern-matched listener.
+- `@Stage()` — Param decorator: inject deployment stage (`dev`/`qa`/`staging`/`prod`).
+- `@Executor()` — Param decorator: inject `UCExecutor`.
+- `@Inject(token)` — Explicit dependency injection by token.
+- `@RequirePermission(...perms, options?)` — Enforce permissions on a method.
+- `@ResolveAuth()` — Attach `AuthContext` to event without enforcing perms.
 
 ### Classes
 
@@ -538,6 +732,15 @@ npm run analyze
 - `InternalServerErrorException` - 500 Internal Server Error exception
 - `BadGatewayException` - 502 Bad Gateway exception
 - `ServiceUnavailableException` - 503 Service Unavailable exception
+
+### Auth / Permissions
+
+- `AuthContext` — shape of the resolved auth (userId, permissions[], roles[], areas[], raw).
+- `IAuthContextResolver` — interface projects implement to extract auth from events.
+- `AUTH_CONTEXT_RESOLVER` — tsyringe token for registering the resolver.
+- `DefaultCognitoAuthResolver` — fallback resolver (Cognito claims).
+- `getAuthContext(event)` — read the auth context a decorator attached to the event.
+- `hasPermission(granted, required)` / `hasAllPermissions` / `hasAnyPermission` — matching utilities with segment wildcards.
 
 ## 🤝 Contributing
 

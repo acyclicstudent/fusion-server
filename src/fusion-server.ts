@@ -88,26 +88,40 @@ export class FusionServer {
         return;
       }
 
-      this.controllers[route] = controller;
-      Object.assign(
+      const controllerId: string =
+        Reflect.getMetadata('fusion:controller-id', controller) ?? route;
+
+      this.controllers[controllerId] = controller;
+
+      this.mergeRouteMap(
+        'GET',
         this.GET,
-        Reflect.getMetadata('fusion:get', controller) || {}
+        Reflect.getMetadata('fusion:get', controller) || {},
+        controller
       );
-      Object.assign(
+      this.mergeRouteMap(
+        'POST',
         this.POST,
-        Reflect.getMetadata('fusion:post', controller) || {}
+        Reflect.getMetadata('fusion:post', controller) || {},
+        controller
       );
-      Object.assign(
+      this.mergeRouteMap(
+        'DELETE',
         this.DELETE,
-        Reflect.getMetadata('fusion:delete', controller) || {}
+        Reflect.getMetadata('fusion:delete', controller) || {},
+        controller
       );
-      Object.assign(
+      this.mergeRouteMap(
+        'PUT',
         this.PUT,
-        Reflect.getMetadata('fusion:put', controller) || {}
+        Reflect.getMetadata('fusion:put', controller) || {},
+        controller
       );
-      Object.assign(
+      this.mergeRouteMap(
+        'PATCH',
         this.PATCH,
-        Reflect.getMetadata('fusion:patch', controller) || {}
+        Reflect.getMetadata('fusion:patch', controller) || {},
+        controller
       );
     });
 
@@ -143,6 +157,27 @@ export class FusionServer {
         };
       }
     };
+  }
+
+  private mergeRouteMap(
+    httpMethod: string,
+    target: { [resource: string]: string },
+    incoming: { [resource: string]: string },
+    controller: Function
+  ): void {
+    for (const resource of Object.keys(incoming)) {
+      const incomingValue = incoming[resource];
+      const existingValue = target[resource];
+      if (existingValue && existingValue !== incomingValue) {
+        const existingId = existingValue.split('|')[0];
+        console.warn(
+          `[FusionServer Warning] Route conflict: ${httpMethod} ${resource} ` +
+            `is registered by multiple controllers (existing=${existingId}, ` +
+            `new=${controller.name}) — new registration wins.`
+        );
+      }
+      target[resource] = incomingValue;
+    }
   }
 
   private shouldHandleAsListener(evt: any): boolean {

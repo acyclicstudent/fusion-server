@@ -1,0 +1,509 @@
+# Fusion Framework Server — Full Reference for LLM Assistants
+
+This document is the authoritative reference when writing or modifying
+code that uses `@fusion-framework/server`. It supersedes the README for
+anything the two disagree on. If something is ambiguous here, prefer
+reading the source files linked from `llms.txt`.
+
+---
+
+## 1. Mental model
+
+Fusion is a thin dispatcher on top of AWS Lambda. One Lambda function
+receives all API Gateway events (and optionally non-HTTP events), and
+Fusion dispatches them to the right controller method or listener based
+on decorator metadata.
+
+Runtime flow for an HTTP request:
+
+1. API Gateway invokes the Lambda with `event.httpMethod` and
+   `event.resource` (the template path, e.g. `/users/{id}`).
+2. `FusionServer.handleController(event)` looks up
+   `this[event.httpMethod][event.resource]` → a string encoding the
+   target controller and method.
+3. The server resolves the controller class from tsyringe and calls
+   the method with `event` as the only positional arg.
+4. The return value is wrapped: a `FusionResponse` gets `toResponse()`
+   applied; `undefined`/`null` becomes 204 No Content; anything else is
+   JSON-stringified with status 200 and `Content-Type: application/json`.
+
+Listener (non-HTTP) flow: the event is matched by event-name first
+(`evt.event` key), otherwise by the first pattern config that matches.
+
+---
+
+## 2. Path parameter syntax — `{id}` only
+
+**This is the most common mistake LLMs make.** Fusion matches routes
+against `event.resource`, which API Gateway fills with the *template*
+path. API Gateway uses `{id}` notation in its templates. Therefore:
+
+```ts
+// ✅ Correct
+@Get('/users/{id}')
+@Put('/orders/{orderId}/items/{itemId}')
+@Delete('/tenants/{tenantId}/users/{userId}')
+
+// ❌ Wrong — will NOT match
+@Get('/users/:id')
+@Put('/orders/:orderId/items/:itemId')
+```
+
+To read path parameter values inside the handler, use
+`event.pathParameters?.id` — those keys match the names inside `{...}`.
+
+Do not file feature requests to add `:id` support. The framework
+deliberately enforces a single syntax to keep projects consistent.
+
+---
+
+## 3. Controller basics
+
+```ts
+import { Controller, Get, Post, FusionResponse } from '@fusion-framework/server';
+import { APIGatewayEvent } from 'aws-lambda';
+
+@Controller('/users')
+export class UsersController {
+  @Get('/')
+  async list() {
+    return { users: [] };            // auto 200 + JSON
+  }
+
+  @Get('/{id}')
+  async getOne(event: APIGatewayEvent) {
+    const id = event.pathParameters?.id;
+    return FusionResponse.ok({ id });
+  }
+
+  @Post('/')
+  async create(event: APIGatewayEvent) {
+    const body = JSON.parse(event.body || '{}');
+    return FusionResponse.created(body).header('Location', `/users/${body.id}`);
+  }
+}
+```
+
+### Rules
+
+- A class must be decorated with `@Controller(basePath)`.
+- HTTP methods (`@Get`, `@Post`, etc.) take a path **relative to the
+  controller's base**. Fusion concatenates them literally, so
+  `@Controller('/users') + @Get('/{id}')` → final route `/users/{id}`.
+- Method signatures: `(event: APIGatewayEvent) => any | Promise<any>`.
+  Return a `FusionResponse` for fine control, or a plain value for auto
+  JSON, or `undefined` for 204.
+- You can have multiple `@Controller('/users')` classes (one for reads,
+  one for writes, etc.). Fusion tags each with a unique internal id so
+  they coexist. Only a true conflict (same HTTP method + same final
+  path from two controllers) logs a warning and last-wins.
+
+---
+
+## 4. Use cases (`@UseCase` + `UCExecutor`)
+
+Use cases encapsulate business logic and are executed, never injected:
+
+```ts
+import { UseCase, UC, UCExecutor } from '@fusion-framework/server';
+
+@UseCase()
+export class CreateUserUC extends UC {
+  async execute(input: { name: string; email: string }) {
+    // business logic here
+    return { id: 'u-1', ...input };
+  }
+}
+
+@Controller('/users')
+export class UsersController {
+  constructor(private ucExecutor: UCExecutor) {}
+
+  @Post('/')
+  async create(event: APIGatewayEvent) {
+    const body = JSON.parse(event.body || '{}');
+    const user = await this.ucExecutor.execute(CreateUserUC, body);
+    return FusionResponse.created(user);
+  }
+}
+```
+
+**Anti-patterns:**
+
+- `constructor(private createUserUC: CreateUserUC)` — wrong.
+- `@Injectable()` on a use case — wrong, use `@UseCase()`.
+- Extending something other than `UC` — wrong.
+
+---
+
+## 5. FusionResponse
+
+The response builder. Chainable. All methods except getters return `this`.
+
+```ts
+FusionResponse.ok(data)                 // 200
+FusionResponse.created(data)            // 201
+FusionResponse.accepted(data)           // 202
+FusionResponse.noContent()              // 204
+FusionResponse.badRequest('why')        // 400
+FusionResponse.unauthorized()           // 401
+FusionResponse.forbidden()              // 403
+FusionResponse.notFound()               // 404
+FusionResponse.conflict()               // 409
+FusionResponse.internalServerError()    // 500
+
+new FusionResponse(data)
+  .status(201)
+  .header('X-Trace-Id', id)
+  .setHeaders({ 'X-A': '1', 'X-B': '2' })
+  .cache(300)                           // Cache-Control: max-age=300
+  .noCache()
+  .cors(['https://app.example'], ['GET', 'POST']);
+
+// Content-type helpers (mutually exclusive with body)
+.json(obj)                              // application/json
+.text('hi')                             // text/plain
+.html('<p/>')                           // text/html
+
+// Binary (base64-encoded bodies)
+FusionResponse.pdf(base64Pdf)
+FusionResponse.image(base64Png, 'png')
+FusionResponse.file(base64, 'application/zip', 'archive.zip')
+new FusionResponse(base64Data).base64().header('Content-Type', 'application/octet-stream');
+```
+
+**`toResponse()` behavior** (what the Lambda actually returns):
+
+- `null`/`undefined` body → empty string body.
+- `string` body → passed through as-is; Content-Type is NOT
+  auto-assigned (use `.header()`, `.binary()`, or a helper).
+- Any other body → `JSON.stringify`'d, Content-Type defaulted to
+  `application/json` if none set.
+- `isBase64Encoded: true` is included iff `.base64()` was called.
+
+---
+
+## 6. Exceptions
+
+All Fusion exceptions extend `FusionException` which carries `code`
+(HTTP status) and `message`. They are `instanceof FusionException` and
+`instanceof Error` after the ES5 prototype fix shipped in the framework.
+
+```ts
+import {
+  ValidationException,        // 400
+  UnauthorizedException,      // 401
+  ForbiddenException,         // 403
+  ResourceNotFoundException,  // 404
+  ConflictException,          // 409
+  UnprocessableEntityException,   // 422
+  TooManyRequestsException,   // 429
+  InternalServerErrorException,   // 500
+  BadGatewayException,        // 502
+  ServiceUnavailableException,    // 503
+  FusionException,            // base — extend for custom codes
+} from '@fusion-framework/server';
+
+throw new ValidationException('email is required');
+```
+
+Uncaught throws inside a handler bubble up; `handleController` catches
+them and returns `{ statusCode: error.code || 500, body: {message, requestId} }`.
+
+### Custom exceptions
+
+```ts
+export class PaymentRequiredException extends FusionException {
+  constructor(message = 'Payment Required') { super(402, message); }
+}
+```
+
+---
+
+## 7. Permissions (`@RequirePermission`)
+
+### Taxonomy
+
+Permissions are colon-separated tokens: `resource:action:scope`. A
+wildcard `*` matches any segment. Examples:
+
+- `operations:read:own` — read own operations
+- `operations:*:area` — any action on operations in caller's area
+- `*` — everything
+
+Matching uses `hasPermission(granted, required)`:
+
+- Exact match wins.
+- `'*'` alone in `granted` matches anything.
+- Per-segment wildcards match one segment each; segment counts must
+  match (`a:b` does NOT match `a:b:c`).
+
+### Enforcing
+
+```ts
+import { RequirePermission, getAuthContext } from '@fusion-framework/server';
+
+@Controller('/operations')
+export class OperationsController {
+  @Get('/{id}')
+  @RequirePermission('operations:read:own')   // all mode (default)
+  async getOne(event: APIGatewayEvent) {
+    const auth = getAuthContext(event);        // attached by decorator
+    return FusionResponse.ok({ id: event.pathParameters!.id, userId: auth?.userId });
+  }
+
+  @Post('/{id}/assign')
+  @RequirePermission('admin:*', 'operations:assign:area', { mode: 'any' })
+  async assign(event: APIGatewayEvent) { /* ... */ }
+
+  @Delete('/{id}')
+  @RequirePermission('operations:delete:*', {
+    onDenied: ({ required }) =>
+      new FusionResponse({ code: 'NO_PERM', required }).status(403),
+  })
+  async remove(event: APIGatewayEvent) { /* ... */ }
+}
+```
+
+- `mode: 'all'` (default) requires every listed permission.
+- `mode: 'any'` requires at least one.
+- `onDenied` customizes the 403 payload.
+- Denied responses are a `FusionResponse` with status 403 and body
+  `{ message: 'Forbidden', required, mode }` by default.
+
+### Where permissions come from — `IAuthContextResolver`
+
+The decorator does **not** hardcode where to read permissions from. It
+delegates to a resolver registered under the `AUTH_CONTEXT_RESOLVER`
+token. If none is registered, a default Cognito resolver reads
+`event.requestContext.authorizer.claims` (or `.jwt.claims`).
+
+Each project should register its own resolver during bootstrap:
+
+```ts
+import {
+  container,
+  AUTH_CONTEXT_RESOLVER,
+  IAuthContextResolver,
+  AuthContext,
+} from '@fusion-framework/server';
+
+class MyCustomAuthResolver implements IAuthContextResolver {
+  resolve(event): AuthContext {
+    // Custom Lambda authorizer stores CSV permissions in context.permissions
+    const auth = (event.requestContext as any)?.authorizer ?? {};
+    return {
+      userId: auth.userId,
+      permissions: (auth.permissions ?? '').split(',').filter(Boolean),
+      roles: JSON.parse(auth.roles ?? '[]'),
+      areas: JSON.parse(auth.areas ?? '[]'),
+    };
+  }
+}
+
+container.register(AUTH_CONTEXT_RESOLVER, { useClass: MyCustomAuthResolver });
+```
+
+Register BEFORE calling `app.createHandler(...)`. Resolver can be
+async; the decorator awaits it.
+
+### Reading the auth context in a handler
+
+```ts
+import { getAuthContext } from '@fusion-framework/server';
+
+async handle(event: APIGatewayEvent) {
+  const auth = getAuthContext(event);
+  // auth is AuthContext | undefined
+  // Only defined if @RequirePermission or @ResolveAuth ran on this method.
+}
+```
+
+### Optional auth — `@ResolveAuth()`
+
+For endpoints that allow anonymous access but want the auth context if
+present:
+
+```ts
+@Get('/public-feed')
+@ResolveAuth()
+async feed(event: APIGatewayEvent) {
+  const auth = getAuthContext(event);
+  return auth ? personalizedFeed(auth.userId) : publicFeed();
+}
+```
+
+---
+
+## 8. Event listeners (non-HTTP)
+
+For SQS, S3, EventBridge, or any custom event you send to the same
+Lambda:
+
+```ts
+import { Listener, EvtListener } from '@fusion-framework/server';
+
+// Event-name based (O(1) dispatch)
+@Listener('user.created')
+export class UserCreatedListener implements EvtListener {
+  async handle(evt: { event: 'user.created'; data: any }) {
+    return { processed: true };
+  }
+}
+
+// Pattern based (dispatched when evt matches all patterns)
+@Listener({
+  patterns: {
+    'Records[0].eventSource': 'aws:sqs',
+    'Records[0].eventSourceARN': /arn:aws:sqs:.*:my-queue$/,
+  },
+})
+export class MyQueueListener implements EvtListener {
+  async handle(evt) { /* ... */ }
+}
+```
+
+Register in the handler:
+
+```ts
+export const handler = app.createHandler({
+  controllers: [UsersController],
+  listeners: [UserCreatedListener, MyQueueListener],
+});
+```
+
+Dispatch order: event-name exact match first, then the first registered
+pattern whose config matches. No match → error response.
+
+---
+
+## 9. Dependency injection
+
+Fusion uses [tsyringe](https://github.com/microsoft/tsyringe). Key
+points:
+
+- `@Controller`, `@Injectable`, and `@UseCase` all register the class
+  with tsyringe.
+- `@Inject(token)` for explicit injection by token.
+- `@Stage()` is a param decorator that injects the deployment stage
+  (`'dev'|'qa'|'staging'|'prod'`), inferred from the Lambda's invoked
+  function ARN at request time.
+- `container` is re-exported. Use `container.register(...)` in bootstrap
+  to wire custom implementations (e.g. auth resolver, repositories).
+- In tests, call `container.reset()` (full reset) or
+  `container.clearInstances()` (keep registrations, drop singletons)
+  between cases.
+
+---
+
+## 10. Bootstrap / handler
+
+```ts
+// handler.ts
+import 'reflect-metadata';       // required at the very top
+import { app, container, AUTH_CONTEXT_RESOLVER } from '@fusion-framework/server';
+import { UsersController } from './controllers/users.controller';
+import { MyCustomAuthResolver } from './auth/resolver';
+
+container.register(AUTH_CONTEXT_RESOLVER, { useClass: MyCustomAuthResolver });
+
+export const handler = app.createHandler({
+  controllers: [UsersController],
+  cors: {
+    enabled: true,
+    allowOrigins: ['https://app.example.com'],
+    allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
+    allowHeaders: ['Content-Type', 'Authorization'],
+    credentials: true,
+    maxAge: 600,
+  },
+});
+```
+
+CORS config is optional. When enabled, headers are merged onto every
+response (including error responses), with origin echo if in the
+`allowOrigins` list.
+
+---
+
+## 11. Common pitfalls (and the right fix)
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Unregistered controller for route GET /users/{id}` | Path uses `:id` instead of `{id}` | Change decorator to `{id}` |
+| `Method 'foo' not found in controller` (after collision fix: no longer possible) | Two `@Controller('/x')` used to collide | Already fixed — if you see this, file a bug |
+| `[FusionServer Warning] Route conflict: GET /users/{id}` | Two distinct classes register the same method+path | Remove the duplicate or differentiate the path |
+| `auth is undefined` inside handler | `@RequirePermission` / `@ResolveAuth` not applied, OR resolver not registered | Add the decorator; register resolver in bootstrap |
+| Permissions always denied | Resolver returns `permissions: []`; usually because claims shape differs from default | Register a custom `IAuthContextResolver` |
+| `instanceof FusionException` returns false | Pre-ES2015 target without prototype restoration | Already fixed in framework; re-run `npm install` |
+| `FusionResponse` body is a string but arrives without Content-Type | Expected — string bodies don't auto-assign MIME | Use `.header('Content-Type', ...)`, `.text()`, `.html()`, or `.binary()` |
+| Decorator complains in TS 5 (`2 args vs 3`) | Testing decorators with `@` syntax without `experimentalDecorators` | Apply decorators as functions in tests: `Get('/x')(Cls.prototype, 'm')` |
+
+---
+
+## 12. Testing patterns
+
+```ts
+import 'reflect-metadata';
+import { container } from '@fusion-framework/server';
+
+describe('UsersController', () => {
+  afterEach(() => container.reset());
+
+  it('uses injected repo', () => {
+    const repo = { find: jest.fn().mockResolvedValue(null) };
+    container.register('UserRepository', { useValue: repo });
+    // ... resolve and test
+  });
+});
+```
+
+For testing `@RequirePermission` / `@ResolveAuth` without full server
+bootstrap, apply the decorator manually (avoids TS 5 decorator
+signature issues):
+
+```ts
+class Ctrl {
+  async handle(evt: any) { return 'ok'; }
+}
+RequirePermission('ops:read:own')(Ctrl.prototype, 'handle');
+```
+
+Register a stub resolver:
+
+```ts
+container.register(AUTH_CONTEXT_RESOLVER, {
+  useValue: { resolve: () => ({ permissions: ['ops:read:*'] }) },
+});
+```
+
+---
+
+## 13. Source map
+
+- `src/fusion-server.ts` — main dispatcher
+- `src/core/decorators/` — all decorators
+  - `http/` — `@Get`, `@Post`, `@Put`, `@Patch`, `@Delete`
+  - `interfaces/` — `@Controller`, `@Listener`
+  - `dependencies/` — `@Injectable`, `@UseCase`, `@Inject`, `@Executor`
+  - `stages/` — `@Stage()`
+  - `security/` — `@RequirePermission`, `@ResolveAuth`, `getAuthContext`
+- `src/core/classes/` — `FusionResponse`, `UC`, `UCExecutor`,
+  `DefaultCognitoAuthResolver`
+- `src/core/exceptions/` — exception hierarchy
+- `src/core/interfaces/` — `EvtListener`, `ListenerMatchConfig`,
+  `AuthContext` / `IAuthContextResolver`
+- `src/core/utils/` — `pattern-matcher`, `permission-matcher`
+- `src/core/registry.ts` — tsyringe helpers
+- `test/` — Jest tests; double as usage examples
+
+---
+
+## 14. Versioning policy
+
+- Additive (new decorators, new FusionResponse helpers): minor bump.
+- Internal metadata format changes (e.g., the `controllerId|method`
+  value format): patch bump; external code should not read raw
+  `fusion:get`/`:post` metadata.
+- Behavioral changes to HTTP response shape or route matching: major
+  bump.

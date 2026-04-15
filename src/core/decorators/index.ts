@@ -10,3 +10,6 @@ export * from './http/get';
 export * from './http/patch';
 export * from './http/put';
 export * from './http/post';
+export * from './security/require-permission';
+export * from './security/resolve-auth';
+export * from './security/current-user';

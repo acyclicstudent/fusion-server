@@ -249,9 +249,13 @@ describe('FusionResponse', () => {
         .base64()
         .toResponse();
 
+      // toResponse only auto-assigns Content-Type when serializing a non-string
+      // body. A raw string (including base64) is passed through unchanged so the
+      // caller decides the MIME type via .binary()/.header() — hence no
+      // Content-Type here. See the binary() test below for the typical flow.
       expect(response).toEqual({
         statusCode: 200,
-        headers: { 'Content-Type': 'application/json' },
+        headers: {},
         body: base64Data,
         isBase64Encoded: true
       });

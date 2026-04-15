@@ -94,10 +94,15 @@ describe('Decorators', () => {
       const routeMetadata = Reflect.getMetadata('fusion:route', TestController);
       expect(routeMetadata).toBe('/api/users');
 
-      // Check that HTTP methods are prefixed with controller route
+      // Check that HTTP methods are prefixed with controller route and carry a
+      // unique controller-id so two controllers with the same path don't collide.
+      const controllerId = Reflect.getMetadata('fusion:controller-id', TestController);
+      expect(controllerId).toBeTruthy();
+      expect(controllerId).toContain('/api/users');
+
       const getMetadata = Reflect.getMetadata('fusion:get', TestController);
       expect(getMetadata).toEqual({
-        '/api/users/list': '/api/users|list'
+        '/api/users/list': `${controllerId}|list`
       });
     });
   });
@@ -134,13 +139,16 @@ describe('Decorators', () => {
 
       // Verify all metadata
       expect(Reflect.getMetadata('fusion:route', TestController)).toBe('/api/items');
-      
+
+      const controllerId = Reflect.getMetadata('fusion:controller-id', TestController);
+      expect(controllerId).toBeTruthy();
+
       const getMetadata = Reflect.getMetadata('fusion:get', TestController);
-      expect(getMetadata['/api/items/']).toBe('/api/items|list');
-      expect(getMetadata['/api/items/:id']).toBe('/api/items|get');
+      expect(getMetadata['/api/items/']).toBe(`${controllerId}|list`);
+      expect(getMetadata['/api/items/:id']).toBe(`${controllerId}|get`);
 
       const postMetadata = Reflect.getMetadata('fusion:post', TestController);
-      expect(postMetadata['/api/items/']).toBe('/api/items|create');
+      expect(postMetadata['/api/items/']).toBe(`${controllerId}|create`);
     });
 
     it('should not interfere between controllers and listeners', () => {

@@ -1,0 +1,78 @@
+# Fusion Framework Server
+
+> Lambda-first TypeScript framework for AWS API Gateway. Decorator-based
+> controllers (NestJS-style), tsyringe DI, use-case pattern, event
+> listeners, and declarative permission checks.
+
+This file is a curated index for LLM assistants. Read `llms-full.txt` for
+the complete reference in one shot, or follow the links below for a
+specific topic. The [README](./README.md) is the marketing-oriented
+overview aimed at humans; `llms-full.txt` is the authoritative reference
+for day-to-day coding.
+
+## Critical conventions (read first)
+
+These are the non-obvious rules that LLMs routinely get wrong. They are
+intentional — do not "fix" them by making the framework more permissive.
+
+- **Path parameters MUST use `{id}`, NOT `:id`.** Fusion routes are
+  matched against `event.resource` from API Gateway, which uses
+  `{id}` notation. `:id` will silently fail to match. The framework
+  will not add Express-style `:id` support; consistency across
+  projects is the reason.
+  - Correct: `@Get('/users/{id}')`, `@Delete('/orders/{orderId}/items/{itemId}')`
+  - Wrong: `@Get('/users/:id')`
+- **Decorator order matters.** `@Get('/x')` (or any HTTP decorator)
+  is applied before `@Controller('/base')` rewrites the metadata.
+  The HTTP decorator goes on the method, `@Controller` on the class.
+  TypeScript applies them in bottom-up order — this is the
+  correct default, don't reorder.
+- **Use cases are invoked via `UCExecutor`, never injected.** A class
+  decorated with `@UseCase()` extends `UC` and is executed via
+  `ucExecutor.execute(MyUC, ...args)`. Injecting a UC into another
+  class's constructor is wrong.
+- **Two `@Controller('/same-path')` classes are allowed.** Each gets a
+  unique internal id. They only conflict if two methods register the
+  exact same (httpMethod, resource) pair — in which case the framework
+  warns and last-registered wins.
+
+## Decorators
+
+- [HTTP decorators (`@Get`, `@Post`, `@Put`, `@Patch`, `@Delete`)](./src/core/decorators/http/)
+- [`@Controller(basePath)`](./src/core/decorators/interfaces/controller.ts)
+- [`@Listener(eventName | matchConfig)`](./src/core/decorators/interfaces/listener.ts)
+- [`@UseCase()` + `UC` base class](./src/core/decorators/dependencies/use-case.ts)
+- [`@Injectable(token?)`](./src/core/decorators/dependencies/injectable.ts)
+- [`@Stage()` param decorator — inject deployment stage](./src/core/decorators/stages/stage.ts)
+- [`@RequirePermission(...perms, options?)`](./src/core/decorators/security/require-permission.ts)
+- [`@ResolveAuth()` — attach auth context without enforcing perms](./src/core/decorators/security/resolve-auth.ts)
+
+## Core classes
+
+- [`FusionResponse` — response builder with chaining](./src/core/classes/fusion-response.ts)
+- [`UC` / `UCExecutor`](./src/core/classes/)
+- [`FusionException` + concrete subclasses (Validation, Unauthorized, …)](./src/core/exceptions/)
+
+## Auth & permissions
+
+- [`IAuthContextResolver` interface + `AUTH_CONTEXT_RESOLVER` token](./src/core/interfaces/auth-context.ts)
+- [`DefaultCognitoAuthResolver` — fallback when no resolver is registered](./src/core/classes/default-auth-resolver.ts)
+- [`hasPermission` / `hasAllPermissions` / `hasAnyPermission`](./src/core/utils/permission-matcher.ts)
+- [`getAuthContext(event)` — read attached auth in handler](./src/core/decorators/security/current-user.ts)
+
+## Event listeners (non-HTTP)
+
+- [`EvtListener` interface](./src/core/interfaces/evt-listener.ts)
+- [Pattern-matched listeners (`ListenerMatchConfig`)](./src/core/interfaces/listener-config.ts)
+- [Pattern extraction helpers](./src/core/utils/pattern-matcher.ts)
+
+## Runtime
+
+- [`FusionServer.createHandler({ controllers, listeners?, cors? })`](./src/fusion-server.ts)
+- Request routing: `event.httpMethod + event.resource` → controller method
+- Listener routing: event-name first (O(1)), then first matching pattern
+
+## Optional
+
+- [Examples](./examples)
+- [Tests — useful as usage reference](./test)
