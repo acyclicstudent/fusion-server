@@ -44,8 +44,15 @@ export function RequirePermission(
     const permissions = args.filter(a => typeof a === 'string') as string[];
     const mode: 'all' | 'any' = opts.mode ?? 'all';
 
-    return function (target: any, propertyKey: string | symbol) {
-        const original = target[propertyKey];
+    return function (target: any, propertyKey: string | symbol, descriptor?: PropertyDescriptor): any {
+        // Legacy (TypeScript experimentalDecorators, esbuild __decorateClass) calls
+        // us with 3 args and the descriptor; if we mutate target[propertyKey] alone,
+        // __decorateClass later restores the ORIGINAL descriptor (bug source). TC39
+        // decorators call with 2 args and no descriptor; then we must mutate the
+        // prototype in place. Handle both.
+        const original: Function = descriptor && descriptor.value
+            ? descriptor.value
+            : target[propertyKey];
 
         Reflect.defineMetadata(
             'fusion:permissions',
@@ -54,7 +61,7 @@ export function RequirePermission(
             propertyKey
         );
 
-        target[propertyKey] = async function (event: APIGatewayEvent, ...rest: any[]) {
+        const wrapped = async function (this: any, event: APIGatewayEvent, ...rest: any[]) {
             const resolver: IAuthContextResolver = container.isRegistered(AUTH_CONTEXT_RESOLVER)
                 ? container.resolve<IAuthContextResolver>(AUTH_CONTEXT_RESOLVER)
                 : defaultResolver;
@@ -81,5 +88,11 @@ export function RequirePermission(
 
             return original.call(this, event, ...rest);
         };
+
+        if (descriptor) {
+            descriptor.value = wrapped;
+            return descriptor;
+        }
+        target[propertyKey] = wrapped;
     };
 }

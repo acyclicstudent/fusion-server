@@ -15,14 +15,25 @@ const defaultResolver = new DefaultCognitoAuthResolver();
  * can still call getAuthContext(event).
  */
 export function ResolveAuth() {
-    return function (target: any, propertyKey: string | symbol) {
-        const original = target[propertyKey];
-        target[propertyKey] = async function (event: APIGatewayEvent, ...rest: any[]) {
+    return function (target: any, propertyKey: string | symbol, descriptor?: PropertyDescriptor): any {
+        // Support both TC39 (2-arg) and legacy (3-arg) decorator calling conventions.
+        // See the comment in require-permission.ts for why.
+        const original: Function = descriptor && descriptor.value
+            ? descriptor.value
+            : target[propertyKey];
+
+        const wrapped = async function (this: any, event: APIGatewayEvent, ...rest: any[]) {
             const resolver: IAuthContextResolver = container.isRegistered(AUTH_CONTEXT_RESOLVER)
                 ? container.resolve<IAuthContextResolver>(AUTH_CONTEXT_RESOLVER)
                 : defaultResolver;
             (event as any)[AUTH_CONTEXT_EVENT_KEY] = await resolver.resolve(event);
             return original.call(this, event, ...rest);
         };
+
+        if (descriptor) {
+            descriptor.value = wrapped;
+            return descriptor;
+        }
+        target[propertyKey] = wrapped;
     };
 }

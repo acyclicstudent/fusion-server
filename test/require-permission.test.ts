@@ -211,3 +211,63 @@ describe('getAuthContext', () => {
     expect(getAuthContext({} as any)).toBeUndefined();
   });
 });
+
+/**
+ * Regression test for the esbuild/TS legacy-decorator case: `__decorateClass`
+ * (the helper TS+esbuild emits) reads the original PropertyDescriptor, passes
+ * it as the 3rd arg, and expects the decorator to RETURN a (possibly updated)
+ * descriptor. If the decorator only mutates `target[propertyKey]` and returns
+ * undefined, __decorateClass will restore the ORIGINAL descriptor via
+ * `Object.defineProperty`, silently un-wrapping the method. The decorator must
+ * therefore update `descriptor.value` and return it.
+ */
+describe('@RequirePermission under legacy __decorateClass emit (esbuild/TS)', () => {
+  afterEach(() => container.reset());
+
+  /** Mimics what TS + esbuild emit at runtime. */
+  function applyLegacyDecorator(
+    decorator: any,
+    ClassRef: any,
+    key: string
+  ): void {
+    const proto = ClassRef.prototype;
+    let descriptor: PropertyDescriptor | undefined = Object.getOwnPropertyDescriptor(proto, key);
+    const result = decorator(proto, key, descriptor);
+    descriptor = (result as PropertyDescriptor) || descriptor;
+    if (descriptor) {
+      Object.defineProperty(proto, key, descriptor);
+    }
+  }
+
+  it('enforces permissions when applied via legacy __decorateClass emit', async () => {
+    container.register(AUTH_CONTEXT_RESOLVER, {
+      useValue: makeResolver({ permissions: [] }),
+    });
+
+    class Ctrl {
+      async handle(_evt: any) {
+        return 'leaked';
+      }
+    }
+    applyLegacyDecorator(RequirePermission('users:read:*'), Ctrl, 'handle');
+
+    const res = (await new Ctrl().handle(mkEvent())) as unknown as FusionResponse;
+    expect(res).toBeInstanceOf(FusionResponse);
+    expect(res.statusCode).toBe(403);
+  });
+
+  it('allows through when permission matches (legacy emit)', async () => {
+    container.register(AUTH_CONTEXT_RESOLVER, {
+      useValue: makeResolver({ permissions: ['users:read:*'] }),
+    });
+
+    class Ctrl {
+      async handle(_evt: any) {
+        return 'ok';
+      }
+    }
+    applyLegacyDecorator(RequirePermission('users:read:own'), Ctrl, 'handle');
+
+    await expect(new Ctrl().handle(mkEvent())).resolves.toBe('ok');
+  });
+});
